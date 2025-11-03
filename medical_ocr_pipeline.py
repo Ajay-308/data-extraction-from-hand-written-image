@@ -22,7 +22,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
 # Logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("medical-ocr-pipeline")
 
 
@@ -104,8 +104,8 @@ class HybridOCREngine:
             self.paddle_printed = PaddleOCR(
                 use_angle_cls=True, 
                 lang=printed_lang,
-                use_gpu=False,
-                show_log=False
+                rec_model_dir='models/en_PP-OCRv4_rec_handwritten',
+                drop_score=0.3  # Lower drop score to catch more text
             )
             logger.info("✅ Paddle printed-text OCR initialized")
         except Exception as e:
@@ -115,22 +115,26 @@ class HybridOCREngine:
         # Handwriting OCR (with different parameters for better detection)
         if enable_handwriting_mode:
             try:
-                # Use same PaddleOCR but with different thresholds
+                # Use separate instance with MUCH lower thresholds for handwriting
                 self.paddle_handwritten = PaddleOCR(
                     use_angle_cls=True,
                     lang=printed_lang,
-                    use_gpu=False,
-                    show_log=False,
-                    det_db_thresh=0.2,  # Lower threshold for handwriting detection
-                    det_db_box_thresh=0.3,  # Lower box threshold
+                    rec_model_dir='models/en_PP-OCRv4_rec_handwritten',
+                    det_db_thresh=0.1,  # Very low threshold for faint handwriting
+                    det_db_box_thresh=0.2,  # Very low box threshold
+                    det_db_unclip_ratio=2.0,  # Larger boxes to catch irregular handwriting
+                    drop_score=0.1,  # Accept very low confidence scores
                     rec_batch_num=1  # Process one at a time for better accuracy
                 )
-                logger.info("✅ Paddle handwritten OCR initialized with optimized settings")
+                logger.info("✅ Paddle handwritten OCR initialized with aggressive settings")
+                self.handwriting_enabled = True
             except Exception as e:
                 logger.warning(f"Could not initialize handwriting-specific settings: {e}")
                 self.paddle_handwritten = self.paddle_printed
+                self.handwriting_enabled = False
         else:
             self.paddle_handwritten = self.paddle_printed
+            self.handwriting_enabled = False
             logger.info("Handwriting mode disabled — using printed OCR only")
 
         logger.info("✅ Enhanced Hybrid OCR ready")
@@ -138,25 +142,46 @@ class HybridOCREngine:
     def _ocr_to_regions(self, ocr_res: Any, region_type: str) -> List[Dict[str, Any]]:
         """Convert PaddleOCR result to region dicts with enhanced metadata."""
         out = []
-        if not ocr_res or not ocr_res[0]:
+        
+        # Handle None or empty results
+        if not ocr_res:
+            logger.debug(f"Empty OCR result for {region_type}")
             return out
             
-        for line in ocr_res[0]:
-            if len(line) >= 2:
+        # PaddleOCR returns list of pages, get first page
+        if isinstance(ocr_res, list) and len(ocr_res) > 0:
+            page_result = ocr_res[0]
+        else:
+            logger.debug(f"Invalid OCR result structure for {region_type}")
+            return out
+            
+        # Check if page result is None or empty
+        if not page_result:
+            logger.debug(f"Empty page result for {region_type}")
+            return out
+            
+        # Process each detected line
+        for line in page_result:
+            try:
+                if not line or len(line) < 2:
+                    continue
+                    
                 bbox = line[0]
                 text_info = line[1]
                 
+                # Extract text and confidence
                 if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
                     text = str(text_info[0]).strip()
                     try:
-                        conf = float(text_info[1] or 0.0)
-                    except Exception:
+                        conf = float(text_info[1] if text_info[1] is not None else 0.0)
+                    except (ValueError, TypeError):
                         conf = 0.0
                 else:
                     text = str(text_info).strip()
                     conf = 0.0
                     
-                if text:
+                # Only add non-empty text
+                if text and len(text) > 0:
                     # Calculate additional metrics
                     num_chars = len(text)
                     num_words = len(text.split())
@@ -165,7 +190,7 @@ class HybridOCREngine:
                     
                     out.append({
                         "text": text,
-                        "confidence": conf,
+                        "confidence": round(conf, 4),
                         "region_type": region_type,
                         "bbox": bbox,
                         "num_chars": num_chars,
@@ -173,6 +198,11 @@ class HybridOCREngine:
                         "has_numbers": has_numbers,
                         "has_special": has_special
                     })
+                    
+            except Exception as e:
+                logger.debug(f"Error parsing line in {region_type}: {e}")
+                continue
+                
         return out
 
     def extract_text_regions(self, image_path: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -186,33 +216,52 @@ class HybridOCREngine:
             logger.error(f"Could not load image: {image_path}")
             return {"printed": [], "handwritten": []}
         
+        logger.info(f"Image loaded: {img.shape}")
+        
         # PRINTED TEXT DETECTION
         printed_regions = []
         try:
             # Preprocess for printed text
             printed_prep = self.preprocessor.preprocess_for_printed(img)
-            # Convert back to RGB for PaddleOCR
-            printed_rgb = cv2.cvtColor(printed_prep, cv2.COLOR_GRAY2BGR)
+            # Convert back to BGR for PaddleOCR (it expects BGR, not RGB)
+            printed_bgr = cv2.cvtColor(printed_prep, cv2.COLOR_GRAY2BGR)
             
-            printed_res = self.paddle_printed.ocr(printed_rgb, cls=True)
+            logger.debug("Running printed OCR...")
+            printed_res = self.paddle_printed.ocr(printed_bgr, cls=True)
             printed_regions = self._ocr_to_regions(printed_res, "printed")
-            logger.info(f"Detected {len(printed_regions)} printed text regions")
+            logger.info(f"✓ Detected {len(printed_regions)} printed text regions")
+            
+            # Log sample detections
+            if printed_regions:
+                sample = printed_regions[0]
+                logger.debug(f"  Sample printed: '{sample['text'][:50]}...' (conf: {sample['confidence']:.3f})")
+                
         except Exception as e:
-            logger.warning(f"Printed OCR failed for {image_path}: {e}")
+            logger.warning(f"Printed OCR failed for {image_path}: {e}", exc_info=True)
 
         # HANDWRITTEN TEXT DETECTION
         handwritten_regions = []
-        try:
-            # Preprocess for handwritten text
-            hand_prep = self.preprocessor.preprocess_for_handwritten(img)
-            # Convert back to RGB for PaddleOCR
-            hand_rgb = cv2.cvtColor(hand_prep, cv2.COLOR_GRAY2BGR)
-            
-            hand_res = self.paddle_handwritten.ocr(hand_rgb, cls=True)
-            handwritten_regions = self._ocr_to_regions(hand_res, "handwritten")
-            logger.info(f"Detected {len(handwritten_regions)} handwritten text regions")
-        except Exception as e:
-            logger.warning(f"Handwritten OCR failed for {image_path}: {e}")
+        if self.handwriting_enabled:
+            try:
+                # Preprocess for handwritten text
+                hand_prep = self.preprocessor.preprocess_for_handwritten(img)
+                # Convert back to BGR for PaddleOCR
+                hand_bgr = cv2.cvtColor(hand_prep, cv2.COLOR_GRAY2BGR)
+                
+                logger.debug("Running handwritten OCR...")
+                hand_res = self.paddle_handwritten.ocr(hand_bgr, cls=True)
+                handwritten_regions = self._ocr_to_regions(hand_res, "handwritten")
+                logger.info(f"✓ Detected {len(handwritten_regions)} handwritten text regions")
+                
+                # Log sample detections
+                if handwritten_regions:
+                    sample = handwritten_regions[0]
+                    logger.debug(f"  Sample handwritten: '{sample['text'][:50]}...' (conf: {sample['confidence']:.3f})")
+                    
+            except Exception as e:
+                logger.warning(f"Handwritten OCR failed for {image_path}: {e}", exc_info=True)
+        else:
+            logger.info("Handwriting detection disabled")
 
         return {
             "printed": printed_regions,
@@ -241,20 +290,25 @@ class HybridOCREngine:
             all_regions.append(r_copy)
         
         if not all_regions:
+            logger.debug("No regions to classify")
             return {"printed": [], "handwritten": []}
+        
+        logger.debug(f"Classifying {len(all_regions)} total regions")
         
         # Deduplicate similar texts (keep highest confidence)
         text_map: Dict[str, Dict[str, Any]] = {}
         for r in all_regions:
             text = r["text"].strip()
-            # Normalize for comparison
+            # Normalize for comparison (lowercase, single spaces)
             key = re.sub(r'\s+', ' ', text.lower()).strip()
-            if not key:
+            if not key or len(key) < 1:
                 continue
                 
             existing = text_map.get(key)
             if not existing or (r.get("confidence", 0.0) > existing.get("confidence", 0.0)):
                 text_map[key] = r
+
+        logger.debug(f"After deduplication: {len(text_map)} unique texts")
 
         # Classify each unique text
         printed_lines: List[str] = []
@@ -264,27 +318,40 @@ class HybridOCREngine:
             text = region["text"]
             conf = float(region.get("confidence", 0.0))
             num_words = region.get("num_words", len(text.split()))
+            num_chars = region.get("num_chars", len(text))
             source = region.get("source", "unknown")
             
-            # Classification heuristics
+            # Classification heuristics (RELAXED for better handwriting detection)
             is_handwritten = False
+            reason = ""
             
-            # Strong indicators of handwriting
-            if conf < 0.60:  # Very low confidence
+            # Very strong indicators of handwriting
+            if conf < 0.50:  # Very low confidence
                 is_handwritten = True
-            elif conf < 0.75 and num_words <= 3:  # Low confidence + short
+                reason = f"very_low_conf_{conf:.3f}"
+            elif conf < 0.70 and num_words <= 5:  # Low-moderate confidence + shortish
                 is_handwritten = True
-            elif source == "handwritten_pass" and conf < 0.85:  # Detected in handwriting pass with moderate conf
+                reason = f"low_conf_short_{conf:.3f}_w{num_words}"
+            elif source == "handwritten_pass" and conf < 0.90:  # Detected in handwriting pass
                 is_handwritten = True
-            elif num_words == 1 and len(text) <= 4 and conf < 0.80:  # Single short word
+                reason = f"hand_pass_{conf:.3f}"
+            elif num_words <= 2 and conf < 0.75:  # Very short text with moderate conf
                 is_handwritten = True
+                reason = f"very_short_{conf:.3f}_w{num_words}"
+            elif num_chars <= 5 and conf < 0.80:  # Single short word/abbreviation
+                is_handwritten = True
+                reason = f"short_chars_{conf:.3f}_c{num_chars}"
             
             # Add to appropriate list
             if is_handwritten:
                 handwritten_lines.append(text)
+                logger.debug(f"  → HANDWRITTEN: '{text[:40]}' ({reason})")
             else:
                 printed_lines.append(text)
+                logger.debug(f"  → PRINTED: '{text[:40]}' (conf:{conf:.3f}, source:{source})")
 
+        logger.info(f"Classification complete: {len(printed_lines)} printed, {len(handwritten_lines)} handwritten")
+        
         return {
             "printed": printed_lines,
             "handwritten": handwritten_lines
@@ -304,11 +371,11 @@ class HybridOCREngine:
         printed_text = "\n".join(classified.get("printed", []))
         handwritten_text = "\n".join(classified.get("handwritten", []))
         
-        logger.info(f"Final classification - Printed: {len(classified['printed'])} lines, Handwritten: {len(classified['handwritten'])} lines")
+        logger.info(f"Final: Printed={len(classified['printed'])} lines, Handwritten={len(classified['handwritten'])} lines")
         
         return {
-            "printed_text": printed_text or "",
-            "handwritten_text": handwritten_text or ""
+            "printed_text": printed_text,
+            "handwritten_text": handwritten_text
         }
 
 
@@ -337,7 +404,7 @@ def convert_pdf_to_images(pdf_path: str, dpi: int = 300) -> List[str]:
 # LLM Enricher (Gemini) with graceful fallback
 # -----------------------
 class MedicalLLMProcessor:
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.5-flash"):
         self.ok = False
         self.model_name = model_name
         if api_key:
@@ -390,13 +457,14 @@ class MedicalLLMProcessor:
         }
 
         if not self.ok:
+            fallback["printed_text"] = raw_text
             return fallback
 
         prompt = (
             "You are a medical data extraction assistant. Extract structured information from this medical document.\n"
             "Return ONLY valid JSON matching these fields:\n"
             + json.dumps(list(fallback.keys()), indent=2)
-            + "\n\nRaw OCR Text (printed only):\n" + (raw_text or "")
+            + "\n\nRaw OCR Text (printed only):\n" + (raw_text[:8000] if raw_text else "")
         )
 
         try:
@@ -407,12 +475,16 @@ class MedicalLLMProcessor:
                 parsed = json.loads(json_candidate)
                 if "handwritten_notes" not in parsed:
                     parsed["handwritten_notes"] = ""
+                if "printed_text" not in parsed:
+                    parsed["printed_text"] = raw_text[:4000]
                 return parsed
             else:
                 logger.warning("LLM returned no parsable JSON; using fallback")
+                fallback["printed_text"] = raw_text
                 return fallback
         except Exception as e:
             logger.warning(f"LLM call/parse failed: {e}")
+            fallback["printed_text"] = raw_text
             return fallback
 
 
@@ -423,21 +495,30 @@ class VectorDatabase:
     def __init__(self, persist_directory: str = "./medical_vector_db", hf_model: str = "sentence-transformers/all-MiniLM-L6-v2"):
         self.persist_directory = persist_directory
         os.makedirs(self.persist_directory, exist_ok=True)
-        self.embeddings = HuggingFaceEmbeddings(model_name=hf_model)
-        self.vector_store = None
-        logger.info(f"Vector DB ready at {self.persist_directory}")
+        try:
+            self.embeddings = HuggingFaceEmbeddings(model_name=hf_model)
+            self.vector_store = None
+            logger.info(f"Vector DB ready at {self.persist_directory}")
+        except Exception as e:
+            logger.warning(f"Could not initialize vector DB: {e}")
+            self.embeddings = None
+            self.vector_store = None
 
     def add_documents(self, texts: List[str], metadatas: List[Dict[str, Any]]) -> List[str]:
-        if not texts:
+        if not texts or not self.embeddings:
             return []
-        self.vector_store = FAISS.from_texts(texts, self.embeddings, metadatas=metadatas)
         try:
-            self.vector_store.save_local(self.persist_directory)
+            self.vector_store = FAISS.from_texts(texts, self.embeddings, metadatas=metadatas)
+            try:
+                self.vector_store.save_local(self.persist_directory)
+            except Exception as e:
+                logger.debug(f"Could not save vector store locally: {e}")
+            ids = [f"vec_{uuid.uuid4().hex[:8]}" for _ in texts]
+            logger.info(f"Stored {len(texts)} documents into vector DB")
+            return ids
         except Exception as e:
-            logger.debug(f"Could not save vector store locally: {e}")
-        ids = [f"vec_{uuid.uuid4().hex[:8]}" for _ in texts]
-        logger.info(f"Stored {len(texts)} documents into vector DB")
-        return ids
+            logger.warning(f"Failed to add documents to vector DB: {e}")
+            return []
 
     def search(self, query: str, k: int = 5):
         if not self.vector_store:
@@ -487,12 +568,15 @@ class MedicalDocumentPipeline:
         else:
             images = [file_path]
 
+        if not images:
+            raise ValueError(f"No images to process from {file_path}")
+
         all_texts_for_vector: List[str] = []
         structured_per_page: List[Dict[str, Any]] = []
 
         for i, img in enumerate(images, start=1):
             logger.info(f"\n{'='*60}")
-            logger.info(f"Processing Page {i}/{len(images)}: {img}")
+            logger.info(f"Processing Page {i}/{len(images)}: {os.path.basename(img)}")
             logger.info(f"{'='*60}")
             
             # Extract text with enhanced handwriting detection
@@ -501,18 +585,24 @@ class MedicalDocumentPipeline:
             handwritten = ocr_dict.get("handwritten_text", "") or ""
 
             # Log extraction results
-            logger.info(f"📄 Printed text: {len(printed)} chars, {len(printed.split())} words")
-            logger.info(f"✍️  Handwritten text: {len(handwritten)} chars, {len(handwritten.split())} words")
+            logger.info(f"📄 Printed: {len(printed)} chars, {len(printed.split())} words")
+            logger.info(f"✍️  Handwritten: {len(handwritten)} chars, {len(handwritten.split())} words")
             
             if handwritten:
-                logger.info(f"✅ Handwritten content detected:\n{handwritten[:200]}...")
+                logger.info(f"✅ Handwritten content preview:\n{handwritten[:300]}...")
+            else:
+                logger.info("ℹ️  No handwritten content detected on this page")
 
             # Use only printed text for LLM structuring
-            structured = self.llm.structure_medical_data(printed) if self.llm.ok else {
-                "printed_text": printed,
-                "handwritten_notes": ""
-            }
-            # Attach handwritten notes
+            if self.llm.ok and printed:
+                structured = self.llm.structure_medical_data(printed)
+            else:
+                structured = {
+                    "printed_text": printed,
+                    "handwritten_notes": ""
+                }
+            
+            # Attach handwritten notes (IMPORTANT: don't overwrite!)
             structured["handwritten_notes"] = handwritten
 
             structured_per_page.append({
@@ -540,15 +630,22 @@ class MedicalDocumentPipeline:
         # Build extracted_data
         extracted_data_pages = []
         for p in structured_per_page:
-            extracted_data_pages.append({
+            page_data = {
                 "page_number": p["page_number"],
                 "printed_text": p["structured"].get("printed_text", ""),
                 "handwritten_text": p["structured"].get("handwritten_notes", ""),
-                "structured_fields": {k: v for k, v in p["structured"].items() if k not in ("printed_text", "handwritten_notes")}
-            })
+                "structured_fields": {}
+            }
+            
+            # Add all structured fields except text fields
+            for k, v in p["structured"].items():
+                if k not in ("printed_text", "handwritten_notes"):
+                    page_data["structured_fields"][k] = v
+                    
+            extracted_data_pages.append(page_data)
 
         prover_json = {
-            "prover_version": "1.1",
+            "prover_version": "1.2",
             "prover_id": str(uuid.uuid4()),
             "timestamp": timestamp,
             "document_header": {
@@ -562,7 +659,7 @@ class MedicalDocumentPipeline:
             "provenance": {
                 "extraction_method": "enhanced_hybrid_ocr_llm",
                 "ocr_engines": ["PaddleOCR (printed)", "PaddleOCR (handwriting-optimized)"],
-                "llm_model": (self.llm.model_name if hasattr(self.llm, "model_name") else None),
+                "llm_model": (self.llm.model_name if hasattr(self.llm, "model_name") and self.llm.ok else None),
                 "confidence_scores": {"ocr_confidence": ocr_confidence},
                 "processing_time_ms": round(proc_ms, 2),
                 "vector_db_ids": vector_ids
@@ -575,7 +672,7 @@ class MedicalDocumentPipeline:
                 "extraction_completeness": round(0.85, 2)
             },
             "audit_trail": {
-                "extracted_by": "Medical OCR Pipeline v1.3 (Enhanced Handwriting)",
+                "extracted_by": "Medical OCR Pipeline v1.3 (Enhanced Handwriting Detection)",
                 "validation_status": "pending",
                 "human_review_required": ocr_confidence < 0.7 or handwritten_regions > 0
             }
@@ -592,12 +689,13 @@ class MedicalDocumentPipeline:
 
         # Print summary
         logger.info(f"\n{'='*60}")
-        logger.info("EXTRACTION SUMMARY")
+        logger.info("📊 EXTRACTION SUMMARY")
         logger.info(f"{'='*60}")
-        logger.info(f"Total pages: {len(images)}")
-        logger.info(f"Printed regions: {printed_regions}")
-        logger.info(f"Handwritten regions: {handwritten_regions}")
-        logger.info(f"Processing time: {proc_ms:.0f}ms")
+        logger.info(f"📄 Total pages: {len(images)}")
+        logger.info(f"🖨️  Printed regions: {printed_regions}")
+        logger.info(f"✍️  Handwritten regions: {handwritten_regions}")
+        logger.info(f"⏱️  Processing time: {proc_ms:.0f}ms")
+        logger.info(f"💾 Output: {out_path}")
         logger.info(f"{'='*60}\n")
 
         return {
@@ -605,7 +703,13 @@ class MedicalDocumentPipeline:
             "document_header": prover_json["document_header"],
             "provenance": prover_json["provenance"],
             "quality_metrics": prover_json["quality_metrics"],
-            "audit_trail": prover_json["audit_trail"]
+            "audit_trail": prover_json["audit_trail"],
+            "extracted_data_summary": {
+                "pages_processed": len(images),
+                "printed_pages": printed_regions,
+                "handwritten_pages": handwritten_regions,
+                "total_text_length": total_chars
+            }
         }
 
 
@@ -613,18 +717,64 @@ class MedicalDocumentPipeline:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Enhanced Medical OCR Pipeline with Handwriting Detection")
-    parser.add_argument("--input", required=True, help="Path to PDF or image")
-    parser.add_argument("--out", default="./output", help="Output directory")
-    parser.add_argument("--gemini_key", default=None, help="Gemini API key (optional)")
-    parser.add_argument("--no-handwriting", action="store_true", help="Disable handwriting detection")
+    parser = argparse.ArgumentParser(
+        description="Enhanced Medical OCR Pipeline with Handwriting Detection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Process PDF with handwriting detection
+  python medical_ocr_pipeline_fixed.py --input document.pdf --gemini_key YOUR_API_KEY
+  
+  # Process image without LLM
+  python medical_ocr_pipeline_fixed.py --input scan.jpg
+  
+  # Disable handwriting detection
+  python medical_ocr_pipeline_fixed.py --input document.pdf --no-handwriting
+  
+  # Debug mode with verbose output
+  python medical_ocr_pipeline_fixed.py --input document.pdf --debug
+        """
+    )
+    parser.add_argument("--input", required=True, help="Path to PDF or image file")
+    parser.add_argument("--out", default="./output", help="Output directory (default: ./output)")
+    parser.add_argument("--gemini_key", default=None, help="Gemini API key for LLM enrichment (optional)")
+    parser.add_argument("--no-handwriting", action="store_true", help="Disable handwriting detection mode")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
-    pipeline = MedicalDocumentPipeline(
-        gemini_api_key=args.gemini_key,
-        vector_db_path="./medical_vector_db",
-        enable_handwriting=not args.no_handwriting
-    )
+    # Set debug logging if requested
+    if args.debug:
+        logging.getLogger("medical-ocr-pipeline").setLevel(logging.DEBUG)
+        logger.info("Debug mode enabled")
+
+    # Validate input file
+    if not os.path.exists(args.input):
+        logger.error(f"Input file not found: {args.input}")
+        exit(1)
+
+    # Create pipeline
+    try:
+        pipeline = MedicalDocumentPipeline(
+            gemini_api_key=args.gemini_key,
+            vector_db_path="./medical_vector_db",
+            enable_handwriting=not args.no_handwriting
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize pipeline: {e}", exc_info=True)
+        exit(1)
     
-    res = pipeline.process_document(args.input, output_dir=args.out)
-    print("\n" + json.dumps(res, indent=2))
+    # Process document
+    try:
+        logger.info(f"Starting pipeline for: {args.input}")
+        res = pipeline.process_document(args.input, output_dir=args.out)
+        
+        # Print summary
+        print("\n" + "="*70)
+        print("✅ PROCESSING COMPLETE")
+        print("="*70)
+        print(json.dumps(res, indent=2))
+        print("="*70)
+        
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}", exc_info=True)
+        exit(1)
