@@ -31,7 +31,32 @@ logger = logging.getLogger("medical-ocr-pipeline")
 # -----------------------
 class ImagePreprocessor:
     """Enhanced preprocessing for better handwriting detection"""
-    
+    def ensure_handwritten_model():
+        model_dir = 'models/en_PP-OCRv4_rec_handwritten'
+        os.makedirs(model_dir, exist_ok=True)
+
+        files = [
+            "inference.pdiparams",
+            "inference.pdiparams.info",
+            "inference.pdmodel"
+        ]
+        
+        base_url = "https://raw.githubusercontent.com/Ajay-308/data-extraction-from-hand-written-image/main/models/en_PP-OCRv4_rec_handwritten"
+
+        for file_name in files:
+            local_path = os.path.join(model_dir, file_name)
+            if not os.path.exists(local_path):
+                print(f"⬇️ Downloading {file_name} from GitHub...")
+                r = requests.get(f"{base_url}/{file_name}")
+                if r.status_code == 200:
+                    with open(local_path, "wb") as f:
+                        f.write(r.content)
+                else:
+                    raise Exception(f"❌ Failed to download {file_name} (status: {r.status_code})")
+
+        print("✅ Handwritten model ready at:", model_dir)
+        return model_dir
+
     @staticmethod
     def preprocess_for_printed(image: np.ndarray) -> np.ndarray:
         """Optimize image for printed text detection"""
@@ -98,8 +123,6 @@ class HybridOCREngine:
         logger.info("Initializing Enhanced Hybrid OCR Engine...")
         
         self.preprocessor = ImagePreprocessor()
-        
-        # Printed OCR (standard configuration)
         try:
             self.paddle_printed = PaddleOCR(
                 use_angle_cls=True, 
@@ -115,16 +138,19 @@ class HybridOCREngine:
         if enable_handwriting_mode:
             try:
                 # Use separate instance with MUCH lower thresholds for handwriting
+                model_path = ensure_handwritten_model()
+
                 self.paddle_handwritten = PaddleOCR(
                     use_angle_cls=True,
                     lang=printed_lang,
-                    rec_model_dir='models/en_PP-OCRv4_rec_handwritten',
-                    det_db_thresh=0.1,  # Very low threshold for faint handwriting
-                    det_db_box_thresh=0.2,  # Very low box threshold
-                    det_db_unclip_ratio=2.0,  # Larger boxes to catch irregular handwriting
-                    drop_score=0.1,  # Accept very low confidence scores
-                    rec_batch_num=1  # Process one at a time for better accuracy
+                    rec_model_dir=model_path,
+                    det_db_thresh=0.1,
+                    det_db_box_thresh=0.2,
+                    det_db_unclip_ratio=2.0,
+                    drop_score=0.1,
+                    rec_batch_num=1
                 )
+
                 logger.info("✅ Paddle handwritten OCR initialized with aggressive settings")
                 self.handwriting_enabled = True
             except Exception as e:
