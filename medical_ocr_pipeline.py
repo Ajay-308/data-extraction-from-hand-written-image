@@ -110,9 +110,9 @@ class HybridOCREngine:
     def __init__(self):
         logger.info("Initializing PaddleOCR...")
         try:
-            self.paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+            self.paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en')
         except Exception:
-            self.paddle_ocr = PaddleOCR(lang='en', show_log=False)
+            self.paddle_ocr = PaddleOCR(lang='en')
         logger.info("✅ PaddleOCR initialized")
         logger.info("✅ Tesseract ready")
 
