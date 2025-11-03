@@ -8,7 +8,8 @@ from datetime import datetime
 
 import streamlit as st
 
-from medical_ocr_pipeline import MedicalDocumentPipeline, VectorDatabase
+from medical_ocr_pipeline import MedicalDocumentPipeline, VectorDBManager
+
 
 # Page config
 st.set_page_config(page_title="Medical Document OCR", page_icon="🏥", layout="wide")
