@@ -1,0 +1,66 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual environments
+venv/
+venv310/
+.env/
+.env.bak
+
+# Environment and credentials
+*.env
+*.key
+*.pem
+*.crt
+*.cert
+*.db
+*.sqlite3
+
+# Output folders
+output/
+medical_vector_db/
+temp/
+tmp*/
+*.tmp
+*.cache
+
+# PDFs, test docs, and temporary files
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.gif
+*.bmp
+
+# IDE and editor configs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Streamlit cache and logs
+.streamlit/
+logs/
+streamlit_logs/
+
+# FAISS index files
+*.faiss
+*.index
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Miscellaneous
+*.zip
+*.tar.gz
+*.bak
