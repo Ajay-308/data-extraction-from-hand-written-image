@@ -56,6 +56,12 @@ class ProverJSON:
                 "vector_db_ids": metadata.get("vector_db_ids", [])
             },
             "extracted_data": extracted_data,
+            "text_analysis": {
+                "handwritten_text": metadata.get("handwritten_text", ""),
+                "printed_text": metadata.get("printed_text", ""),
+                "handwritten_items": metadata.get("handwritten_items", []),
+                "printed_items": metadata.get("printed_items", [])
+            },
             "quality_metrics": {
                 "overall_confidence": metadata.get("overall_confidence", 0.0),
                 "handwritten_regions": metadata.get("handwritten_regions", 0),
@@ -63,7 +69,7 @@ class ProverJSON:
                 "extraction_completeness": metadata.get("completeness", 0.0)
             },
             "audit_trail": {
-                "extracted_by": "Medical OCR Pipeline v1.1",
+                "extracted_by": "Medical OCR Pipeline v1.2",
                 "validation_status": "pending",
                 "human_review_required": metadata.get("review_required", False)
             }
@@ -107,7 +113,8 @@ class DocumentPreprocessor:
 # -------------------------
 class HybridOCREngine:
     """Uses PaddleOCR for printed text and Tesseract for handwritten + fallback."""
-    def __init__(self):
+    def __init__(self, handwritten_threshold: float = 0.65):
+        self.handwritten_threshold = handwritten_threshold
         logger.info("Initializing PaddleOCR...")
         try:
             self.paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en')
@@ -178,13 +185,38 @@ class HybridOCREngine:
         combined = paddle_res["raw_text"] if len(paddle_res["raw_text"]) > 20 else tess_res["raw_text"]
         all_items = paddle_res["items"] + tess_res["items"]
         avg_conf = (paddle_res.get("confidence", 0.0) + tess_res.get("confidence", 0.0)) / 2.0
-        return {"items": all_items, "raw_text": combined, "confidence": avg_conf, "engines_used": ["PaddleOCR", "Tesseract"]}
+        
+        handwritten_items = []
+        printed_items = []
+        handwritten_text = []
+        printed_text = []
+        
+        for item in all_items:
+            conf = item.get("confidence", 0.0)
+            text = item.get("text", "")
+            if conf < self.handwritten_threshold:
+                handwritten_items.append(item)
+                handwritten_text.append(text)
+            else:
+                printed_items.append(item)
+                printed_text.append(text)
+        
+        return {
+            "items": all_items,
+            "raw_text": combined,
+            "confidence": avg_conf,
+            "engines_used": ["PaddleOCR", "Tesseract"],
+            "handwritten_items": handwritten_items,
+            "printed_items": printed_items,
+            "handwritten_text": " ".join(handwritten_text),
+            "printed_text": " ".join(printed_text)
+        }
 
 # -------------------------
 # LLM Enricher (Gemini)
 # -------------------------
 class LLMEnricher:
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.5-flash"):
         self.api_key = api_key
         self.model_name = model_name
         self.ok = False
@@ -198,16 +230,21 @@ class LLMEnricher:
         else:
             logger.warning("No Gemini API key provided. LLM enrichment will be skipped.")
 
-    def structure_medical_data(self, raw_text: str, image: Optional[np.ndarray] = None) -> Dict:
+    def structure_medical_data(self, raw_text: str, handwritten_text: str = "", image: Optional[np.ndarray] = None) -> Dict:
         fallback = {
             "patient_information": {"name": "", "age": "", "gender": "", "id": ""},
-            "clinical_notes": {"presenting_complaint": "", "provisional_diagnosis": "", "line_of_treatment": "", "admitting_ward": ""},
+            "clinical_notes": {
+                "presenting_complaint": "", 
+                "provisional_diagnosis": "", 
+                "line_of_treatment": "", 
+                "admitting_ward": ""
+            },
             "investigations": {"advised_tests": [], "results": []},
             "vitals": {"BP": "", "PR": "", "RR": "", "Temp": "", "SpO2": "", "Height": "", "Weight": ""},
             "medications": [],
             "consultant_details": {"doctor_name": "", "registration_number": "", "hospital": ""},
             "administrative": {"date": "", "stamps_signatures": "", "department": ""},
-            "handwritten_notes": "",
+            "handwritten_notes": handwritten_text,
             "printed_text": raw_text[:4000]
         }
         if not self.ok:
@@ -215,11 +252,29 @@ class LLMEnricher:
             return fallback
 
         prompt = f"""You are a medical data extraction assistant. Extract structured information from the following medical document OCR text.
-Return ONLY valid JSON matching this exact structure (no explanation)."""
+
+PRINTED TEXT:
+{raw_text[:2500]}
+
+HANDWRITTEN TEXT (if any):
+{handwritten_text[:500]}
+
+Return ONLY valid JSON matching this exact structure (no explanation):
+{{
+  "patient_information": {{"name": "", "age": "", "gender": "", "id": ""}},
+  "clinical_notes": {{"presenting_complaint": "", "provisional_diagnosis": "", "line_of_treatment": "", "admitting_ward": ""}},
+  "investigations": {{"advised_tests": [], "results": []}},
+  "vitals": {{"BP": "", "PR": "", "RR": "", "Temp": "", "SpO2": "", "Height": "", "Weight": ""}},
+  "medications": [],
+  "consultant_details": {{"doctor_name": "", "registration_number": "", "hospital": ""}},
+  "administrative": {{"date": "", "stamps_signatures": "", "department": ""}},
+  "handwritten_notes": "{handwritten_text[:500]}",
+  "printed_text": "{raw_text[:500]}"
+}}"""
 
         try:
             model = genai.GenerativeModel(self.model_name)
-            resp = model.generate_content(f"{prompt}\n\n{raw_text[:3000]}")
+            resp = model.generate_content(prompt)
             text = resp.text.strip()
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0]
@@ -264,6 +319,26 @@ class VectorDBManager:
             logger.warning(f"Failed to add to vector DB: {e}")
             return ""
         return vector_id
+    
+    def search(self, query: str, k: int = 5) -> List[Dict]:
+        try:
+            query_embedding = self.embedder.encode(query).tolist()
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=k
+            )
+            formatted_results = []
+            if results and results.get("documents"):
+                for i in range(len(results["documents"][0])):
+                    formatted_results.append({
+                        "document": results["documents"][0][i],
+                        "score": 1 - results["distances"][0][i] if "distances" in results else 0,
+                        "metadata": results["metadatas"][0][i] if "metadatas" in results else {}
+                    })
+            return formatted_results
+        except Exception as e:
+            logger.error(f"Search failed: {e}")
+            return []
 
 # -------------------------
 # Main Pipeline
@@ -292,7 +367,6 @@ class MedicalDocumentPipeline:
         file_hash = self.calculate_file_hash(file_path)
         ext = os.path.splitext(file_path)[1].lower()
 
-        # Load images
         if ext == ".pdf":
             logger.info("Converting PDF to images...")
             images = self.preprocessor.pdf_to_images(file_path)
@@ -304,66 +378,112 @@ class MedicalDocumentPipeline:
             images = [cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)]
 
         all_ocr, vector_ids = [], []
+        all_handwritten_text, all_printed_text = [], []
+        all_handwritten_items, all_printed_items = [], []
+        
         for i, img in enumerate(images):
             logger.info(f"Processing page {i+1}/{len(images)}...")
             pre = self.preprocessor.preprocess_image(img)
             ocr_res = self.ocr_engine.hybrid_extract(pre)
             all_ocr.append(ocr_res)
-            page_meta = {"document_id": doc_id, "page_number": i+1, "source_file": os.path.basename(file_path), "extraction_date": datetime.utcnow().isoformat()}
+            
+            if ocr_res.get("handwritten_text"):
+                all_handwritten_text.append(ocr_res["handwritten_text"])
+            if ocr_res.get("printed_text"):
+                all_printed_text.append(ocr_res["printed_text"])
+            if ocr_res.get("handwritten_items"):
+                all_handwritten_items.extend(ocr_res["handwritten_items"])
+            if ocr_res.get("printed_items"):
+                all_printed_items.extend(ocr_res["printed_items"])
+            
+            page_meta = {
+                "document_id": doc_id, 
+                "page_number": i+1, 
+                "source_file": os.path.basename(file_path), 
+                "extraction_date": datetime.utcnow().isoformat()
+            }
             vid = self.vector_db.add_document(doc_id, ocr_res.get("raw_text", ""), page_meta)
             if vid:
                 vector_ids.append(vid)
 
         combined = "\n\n".join([r.get("raw_text", "") for r in all_ocr])
-        avg_conf = sum([r.get("confidence", 0.0) for r in all_ocr]) / max(len(all_ocr), 1)
+        combined_handwritten = "\n".join(all_handwritten_text)
+        combined_printed = "\n".join(all_printed_text)
+        avg_conf = sum([r.get("confidence", 0.0) for r in all_ocr]) / max(1, len(all_ocr))
 
-        structured = self.llm_enricher.structure_medical_data(combined)
-        proc_ms = (datetime.now() - start).total_seconds() * 1000.0
+        structured_data = self.llm_enricher.structure_medical_data(
+            raw_text=combined,
+            handwritten_text=combined_handwritten
+        )
 
-        document_info = {
+        elapsed = (datetime.now() - start).total_seconds() * 1000
+
+        metadata = {
+            "extraction_method": "hybrid_ocr",
+            "ocr_engines": ["PaddleOCR", "Tesseract"],
+            "llm_model": self.llm_enricher.model_name,
+            "confidence_scores": {"average": avg_conf},
+            "processing_time_ms": elapsed,
+            "vector_db_ids": vector_ids,
+            "overall_confidence": avg_conf,
+            "handwritten_regions": len(all_handwritten_items),
+            "printed_regions": len(all_printed_items),
+            "completeness": 1.0 if combined else 0.0,
+            "handwritten_text": combined_handwritten,
+            "printed_text": combined_printed,
+            "handwritten_items": all_handwritten_items,
+            "printed_items": all_printed_items
+        }
+
+        doc_info = {
             "document_id": doc_id,
-            "document_type": "medical_clinical_notes",
+            "document_type": "medical_record",
             "source_file": os.path.basename(file_path),
             "file_hash": file_hash,
             "page_count": len(images)
         }
 
-        metadata = {
-            "extraction_method": "hybrid_ocr_llm",
-            "ocr_engines": ["PaddleOCR", "Tesseract"],
-            "llm_model": self.llm_enricher.model_name,
-            "confidence_scores": {"ocr_confidence": round(avg_conf, 3)},
-            "processing_time_ms": round(proc_ms, 2),
-            "vector_db_ids": vector_ids,
-            "overall_confidence": round(avg_conf, 3),
-            "handwritten_regions": len([item for r in all_ocr for item in r.get("items", []) if item.get("confidence", 0) < 0.7]),
-            "printed_regions": len([item for r in all_ocr for item in r.get("items", []) if item.get("confidence", 0) >= 0.7]),
-            "completeness": 0.85,
-            "review_required": avg_conf < 0.7
-        }
-
-        prover_json = ProverJSON.create(document_info, structured, metadata)
-
+        prover_json = ProverJSON.create(doc_info, structured_data, metadata)
         out_path = os.path.join(output_dir, f"{doc_id}_prover.json")
+
+        # Save and verify
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(prover_json, f, indent=2, ensure_ascii=False)
 
-        logger.info(f"✅ Saved Prover JSON: {out_path}")
-        logger.info(f"✅ Processing complete in {proc_ms/1000:.2f}s")
+        if not os.path.exists(out_path):
+            logger.error(f"❌ Could not find saved Prover JSON at: {out_path}")
+        else:
+            logger.info(f"✅ Saved Prover JSON: {out_path}")
+
+        logger.info(f"✅ Processing complete in {elapsed/1000:.2f}s")
 
         return {
             "document_id": doc_id,
-            "output_path": out_path,
+            "prover_json_path": out_path,
+            "document_header": prover_json.get("document_header"),
+            "provenance": prover_json.get("provenance"),
+            "quality_metrics": prover_json.get("quality_metrics"),
+            "text_analysis": prover_json.get("text_analysis"),
+            "handwritten_text": combined_handwritten,
+            "printed_text": combined_printed,
             "prover_json": prover_json
         }
 
 # -------------------------
-# Example usage (for testing)
+# Example Usage
 # -------------------------
 if __name__ == "__main__":
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None)
-    pipeline = MedicalDocumentPipeline(
-        gemini_api_key=GEMINI_API_KEY,
-        vector_db_path="./medical_vector_db"
-    )
-    print("✅ Medical OCR Pipeline ready. Import this module in your Streamlit app.")
+    import argparse
+    parser = argparse.ArgumentParser(description="Medical Document OCR Pipeline")
+    parser.add_argument("--file", required=True, help="Path to medical document (PDF or image)")
+    parser.add_argument("--output", default="./output", help="Output directory")
+    parser.add_argument("--api_key", default=None, help="Gemini API key (optional)")
+    args = parser.parse_args()
+
+    pipeline = MedicalDocumentPipeline(gemini_api_key=args.api_key)
+    result = pipeline.process_document(args.file, args.output)
+
+    print("\n=== PIPELINE COMPLETE ===")
+    print(f"Document ID: {result['document_id']}")
+    print(f"Prover JSON Path: {result['prover_json_path']}")
+    print(f"Extracted Fields: {json.dumps(result['prover_json']['extracted_data'], indent=2)}")
