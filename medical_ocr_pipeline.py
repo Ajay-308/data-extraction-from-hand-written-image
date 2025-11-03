@@ -17,7 +17,6 @@ import pytesseract
 from sentence_transformers import SentenceTransformer
 import chromadb
 import google.generativeai as genai
-import pytesseract
 import re
 
 pytesseract.pytesseract.tesseract_cmd = r"C:/Program Files/Tesseract-OCR/tesseract.exe"
@@ -25,8 +24,6 @@ pytesseract.pytesseract.tesseract_cmd = r"C:/Program Files/Tesseract-OCR/tessera
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("medical-ocr-pipeline")
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 
 class ProverJSON:
