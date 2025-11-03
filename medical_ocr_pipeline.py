@@ -27,6 +27,7 @@ logger = logging.getLogger("medical-ocr-pipeline")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
+
 # -------------------------
 # Helper / Prover JSON
 # -------------------------
@@ -75,6 +76,7 @@ class ProverJSON:
             }
         }
 
+
 # -------------------------
 # Preprocessor
 # -------------------------
@@ -107,6 +109,7 @@ class DocumentPreprocessor:
         kernel = np.ones((2, 2), np.uint8)
         cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         return cleaned
+
 
 # -------------------------
 # Hybrid OCR Engine
@@ -186,11 +189,7 @@ class HybridOCREngine:
         all_items = paddle_res["items"] + tess_res["items"]
         avg_conf = (paddle_res.get("confidence", 0.0) + tess_res.get("confidence", 0.0)) / 2.0
         
-        handwritten_items = []
-        printed_items = []
-        handwritten_text = []
-        printed_text = []
-        
+        handwritten_items, printed_items, handwritten_text, printed_text = [], [], [], []
         for item in all_items:
             conf = item.get("confidence", 0.0)
             text = item.get("text", "")
@@ -211,6 +210,7 @@ class HybridOCREngine:
             "handwritten_text": " ".join(handwritten_text),
             "printed_text": " ".join(printed_text)
         }
+
 
 # -------------------------
 # LLM Enricher (Gemini)
@@ -287,6 +287,7 @@ Return ONLY valid JSON matching this exact structure (no explanation):
             logger.warning(f"LLM call failed: {e}")
             return fallback
 
+
 # -------------------------
 # Vector DB Manager
 # -------------------------
@@ -339,6 +340,7 @@ class VectorDBManager:
         except Exception as e:
             logger.error(f"Search failed: {e}")
             return []
+
 
 # -------------------------
 # Main Pipeline
@@ -450,16 +452,16 @@ class MedicalDocumentPipeline:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(prover_json, f, indent=2, ensure_ascii=False)
 
-        if not os.path.exists(out_path):
-            logger.error(f"❌ Could not find saved Prover JSON at: {out_path}")
-        else:
+        if os.path.exists(out_path):
             logger.info(f"✅ Saved Prover JSON: {out_path}")
+        else:
+            logger.error(f"❌ Could not find saved Prover JSON at: {out_path}")
 
         logger.info(f"✅ Processing complete in {elapsed/1000:.2f}s")
 
         return {
             "document_id": doc_id,
-            "prover_json_path": out_path,
+            "output_path": out_path,  # ✅ unified naming
             "document_header": prover_json.get("document_header"),
             "provenance": prover_json.get("provenance"),
             "quality_metrics": prover_json.get("quality_metrics"),
@@ -469,8 +471,9 @@ class MedicalDocumentPipeline:
             "prover_json": prover_json
         }
 
+
 # -------------------------
-# Example Usage
+# Example CLI Usage
 # -------------------------
 if __name__ == "__main__":
     import argparse
@@ -485,5 +488,5 @@ if __name__ == "__main__":
 
     print("\n=== PIPELINE COMPLETE ===")
     print(f"Document ID: {result['document_id']}")
-    print(f"Prover JSON Path: {result['prover_json_path']}")
+    print(f"Prover JSON Path: {result['output_path']}")
     print(f"Extracted Fields: {json.dumps(result['prover_json']['extracted_data'], indent=2)}")
