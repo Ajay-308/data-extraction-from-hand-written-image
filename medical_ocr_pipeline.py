@@ -166,7 +166,7 @@ if __name__ == "__main__":
     file_path = r"C:\Users\mraja\Downloads\test_doc.pdf"
 
     # ✅ Gemini API key
-    api_key = "AIzaSyA5C3-AIH7ZIykTGz4qYhQ1ehH5GjCx3Is"
+    api_key = os.getenv("GEMINI_API_KEY")
 
     pipeline = MedicalDocumentPipeline(
         gemini_api_key=api_key,
