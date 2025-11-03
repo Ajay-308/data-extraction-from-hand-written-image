@@ -105,7 +105,6 @@ class HybridOCREngine:
                 use_angle_cls=True, 
                 lang=printed_lang,
                 rec_model_dir='models/en_PP-OCRv4_rec_handwritten',
-                drop_score=0.3  # Lower drop score to catch more text
             )
             logger.info("✅ Paddle printed-text OCR initialized")
         except Exception as e:
