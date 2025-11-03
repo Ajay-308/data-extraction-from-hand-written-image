@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional
 import cv2
 import numpy as np
 from PIL import Image
-import fitz  # PyMuPDF
+import fitz 
 from paddleocr import PaddleOCR
 import pytesseract
 from sentence_transformers import SentenceTransformer
@@ -20,18 +20,14 @@ import google.generativeai as genai
 import pytesseract
 import re
 
-# For Windows — manually specify the Tesseract executable path
 pytesseract.pytesseract.tesseract_cmd = r"C:/Program Files/Tesseract-OCR/tesseract.exe"
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("medical-ocr-pipeline")
 
-# Optional environment tweaks
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-# Helper / Prover JSON
 
 class ProverJSON:
     @staticmethod
@@ -534,7 +530,7 @@ class MedicalDocumentPipeline:
 
         return {
             "document_id": doc_id,
-            "output_path": out_path,  # ✅ unified naming
+            "output_path": out_path,
             "document_header": prover_json.get("document_header"),
             "provenance": prover_json.get("provenance"),
             "quality_metrics": prover_json.get("quality_metrics"),
