@@ -4,6 +4,7 @@ Pillow==10.4.0
 numpy==1.26.4
 pytesseract==0.3.10
 paddleocr==2.7.0   
+easyocr==1.7.1
 PyMuPDF==1.24.8
 pdf2image==1.17.0
 sentence-transformers==2.2.2

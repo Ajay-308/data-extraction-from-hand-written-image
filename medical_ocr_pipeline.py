@@ -1,11 +1,10 @@
-# -------------------------
-# Imports
-# -------------------------
+
 import os
 import json
 import uuid
 import hashlib
 import logging
+import easyocr
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -18,6 +17,11 @@ import pytesseract
 from sentence_transformers import SentenceTransformer
 import chromadb
 import google.generativeai as genai
+import pytesseract
+import re
+
+# For Windows — manually specify the Tesseract executable path
+pytesseract.pytesseract.tesseract_cmd = r"C:/Program Files/Tesseract-OCR/tesseract.exe"
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -27,10 +31,8 @@ logger = logging.getLogger("medical-ocr-pipeline")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-
-# -------------------------
 # Helper / Prover JSON
-# -------------------------
+
 class ProverJSON:
     @staticmethod
     def create(document_info: Dict, extracted_data: Dict, metadata: Dict) -> Dict:
@@ -58,11 +60,12 @@ class ProverJSON:
             },
             "extracted_data": extracted_data,
             "text_analysis": {
-                "handwritten_text": metadata.get("handwritten_text", ""),
-                "printed_text": metadata.get("printed_text", ""),
-                "handwritten_items": metadata.get("handwritten_items", []),
-                "printed_items": metadata.get("printed_items", [])
+                "handwritten_text": extracted_data.get("handwritten_notes", ""),
+                "printed_text": extracted_data.get("printed_text", ""),
+                "handwritten_items": [],
+                "printed_items": []
             },
+
             "quality_metrics": {
                 "overall_confidence": metadata.get("overall_confidence", 0.0),
                 "handwritten_regions": metadata.get("handwritten_regions", 0),
@@ -76,10 +79,7 @@ class ProverJSON:
             }
         }
 
-
-# -------------------------
 # Preprocessor
-# -------------------------
 class DocumentPreprocessor:
     @staticmethod
     def pdf_to_images(pdf_path: str, dpi: int = 300) -> List[np.ndarray]:
@@ -110,21 +110,69 @@ class DocumentPreprocessor:
         cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         return cleaned
 
-
-# -------------------------
 # Hybrid OCR Engine
-# -------------------------
 class HybridOCREngine:
     """Uses PaddleOCR for printed text and Tesseract for handwritten + fallback."""
-    def __init__(self, handwritten_threshold: float = 0.65):
+    def __init__(self, handwritten_threshold: float = 0.7):
         self.handwritten_threshold = handwritten_threshold
+        self.available_engines: List[str] = []
+
         logger.info("Initializing PaddleOCR...")
         try:
             self.paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en')
-        except Exception:
-            self.paddle_ocr = PaddleOCR(lang='en')
-        logger.info("✅ PaddleOCR initialized")
-        logger.info("✅ Tesseract ready")
+            self.available_engines.append("PaddleOCR")
+            logger.info("✅ PaddleOCR initialized")
+        except Exception as e:
+            logger.warning(f"PaddleOCR init failed: {e}")
+            self.paddle_ocr = None
+        try:
+            _ = pytesseract.get_tesseract_version()
+            self.available_engines.append("Tesseract")
+            logger.info("✅ Tesseract available")
+        except Exception as e:
+            logger.warning(f"Tesseract not available: {e}")
+
+        try:
+            self.easyocr_reader = easyocr.Reader(['en'])
+            self.available_engines.append("EasyOCR")
+            logger.info("✅ EasyOCR initialized for handwriting")
+        except Exception as e:
+            logger.warning(f"EasyOCR init failed: {e}")
+            self.easyocr_reader = None
+    def extract_text_easyocr(self, image: np.ndarray) -> Dict:
+        """
+        Extract text using EasyOCR (useful for handwritten or mixed text).
+        Returns {items, raw_text, confidence}.
+        """
+        if self.easyocr_reader is None:
+            logger.warning("EasyOCR not initialized; skipping.")
+            return {"items": [], "raw_text": "", "confidence": 0.0}
+
+        try:
+            results = self.easyocr_reader.readtext(image)
+        except Exception as e:
+            logger.warning(f"EasyOCR failed: {e}")
+            return {"items": [], "raw_text": "", "confidence": 0.0}
+
+        extracted_items, all_text, total_conf, count = [], [], 0.0, 0
+        for res in results:
+            try:
+                bbox, text, conf = res
+                extracted_items.append({
+                    "text": text,
+                    "confidence": round(float(conf), 3),
+                    "bbox": bbox,
+                    "engine": "EasyOCR"
+                })
+                all_text.append(text)
+                total_conf += conf
+                count += 1
+            except Exception:
+                continue
+
+        avg_conf = (total_conf / count) if count else 0.0
+        return {"items": extracted_items, "raw_text": " ".join(all_text), "confidence": avg_conf}
+
 
     def extract_text_paddle(self, image: np.ndarray) -> Dict:
         if image is None:
@@ -183,12 +231,37 @@ class HybridOCREngine:
         return {"items": extracted_items, "raw_text": " ".join(all_text), "confidence": avg_conf}
 
     def hybrid_extract(self, image: np.ndarray) -> Dict:
-        paddle_res = self.extract_text_paddle(image)
-        tess_res = self.extract_text_tesseract(image)
-        combined = paddle_res["raw_text"] if len(paddle_res["raw_text"]) > 20 else tess_res["raw_text"]
-        all_items = paddle_res["items"] + tess_res["items"]
-        avg_conf = (paddle_res.get("confidence", 0.0) + tess_res.get("confidence", 0.0)) / 2.0
-        
+        # Run each extractor only if initialized
+        paddle_res = {"items": [], "raw_text": "", "confidence": 0.0}
+        tess_res = {"items": [], "raw_text": "", "confidence": 0.0}
+        easy_res = {"items": [], "raw_text": "", "confidence": 0.0}
+
+        if getattr(self, "paddle_ocr", None) is not None:
+            paddle_res = self.extract_text_paddle(image)
+        if "Tesseract" in self.available_engines:
+            tess_res = self.extract_text_tesseract(image)
+        if getattr(self, "easyocr_reader", None) is not None:
+            easy_res = self.extract_text_easyocr(image)
+
+        # Combine text from engines (printed-first preference, but concat all)
+        texts = []
+        if paddle_res.get("raw_text"):
+            texts.append(paddle_res["raw_text"])
+        if tess_res.get("raw_text"):
+            texts.append(tess_res["raw_text"])
+        if easy_res.get("raw_text"):
+            texts.append(easy_res["raw_text"])
+        combined = "\n".join(t for t in texts if t).strip()
+
+        all_items = paddle_res["items"] + tess_res["items"] + easy_res["items"]
+        # safe avg: ignore NaNs
+        confs = [float(x) for x in [
+            paddle_res.get("confidence", 0.0),
+            tess_res.get("confidence", 0.0),
+            easy_res.get("confidence", 0.0)
+        ]]
+        avg_conf = float(np.mean(confs)) if confs else 0.0
+
         handwritten_items, printed_items, handwritten_text, printed_text = [], [], [], []
         for item in all_items:
             conf = item.get("confidence", 0.0)
@@ -199,12 +272,12 @@ class HybridOCREngine:
             else:
                 printed_items.append(item)
                 printed_text.append(text)
-        
+
         return {
             "items": all_items,
             "raw_text": combined,
             "confidence": avg_conf,
-            "engines_used": ["PaddleOCR", "Tesseract"],
+            "engines_used": list(self.available_engines),
             "handwritten_items": handwritten_items,
             "printed_items": printed_items,
             "handwritten_text": " ".join(handwritten_text),
@@ -212,9 +285,7 @@ class HybridOCREngine:
         }
 
 
-# -------------------------
 # LLM Enricher (Gemini)
-# -------------------------
 class LLMEnricher:
     def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.5-flash"):
         self.api_key = api_key
@@ -288,9 +359,7 @@ Return ONLY valid JSON matching this exact structure (no explanation):
             return fallback
 
 
-# -------------------------
 # Vector DB Manager
-# -------------------------
 class VectorDBManager:
     def __init__(self, persist_directory: str = "./chroma_db"):
         try:
@@ -341,15 +410,12 @@ class VectorDBManager:
             logger.error(f"Search failed: {e}")
             return []
 
-
-# -------------------------
 # Main Pipeline
-# -------------------------
 class MedicalDocumentPipeline:
     def __init__(self, gemini_api_key: Optional[str] = None, vector_db_path: str = "./chroma_db"):
         logger.info("Initializing Medical Document Pipeline...")
         self.preprocessor = DocumentPreprocessor()
-        self.ocr_engine = HybridOCREngine()
+        self.ocr_engine = HybridOCREngine(handwritten_threshold=0.7)
         self.llm_enricher = LLMEnricher(api_key=gemini_api_key)
         self.vector_db = VectorDBManager(vector_db_path)
         logger.info("✅ Pipeline initialized successfully")
@@ -412,10 +478,17 @@ class MedicalDocumentPipeline:
         combined_handwritten = "\n".join(all_handwritten_text)
         combined_printed = "\n".join(all_printed_text)
         avg_conf = sum([r.get("confidence", 0.0) for r in all_ocr]) / max(1, len(all_ocr))
+        def clean_text(text):
+            text = re.sub(r'[^A-Za-z0-9\s.,:/-]', ' ', text)
+            text = re.sub(r'\s+', ' ', text)
+            return text.strip()
+
+        combined_cleaned = clean_text(combined)
+        handwritten_cleaned = clean_text(combined_handwritten)
 
         structured_data = self.llm_enricher.structure_medical_data(
-            raw_text=combined,
-            handwritten_text=combined_handwritten
+            raw_text=combined_cleaned,
+            handwritten_text=handwritten_cleaned
         )
 
         elapsed = (datetime.now() - start).total_seconds() * 1000
@@ -470,23 +543,3 @@ class MedicalDocumentPipeline:
             "printed_text": combined_printed,
             "prover_json": prover_json
         }
-
-
-# -------------------------
-# Example CLI Usage
-# -------------------------
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Medical Document OCR Pipeline")
-    parser.add_argument("--file", required=True, help="Path to medical document (PDF or image)")
-    parser.add_argument("--output", default="./output", help="Output directory")
-    parser.add_argument("--api_key", default=None, help="Gemini API key (optional)")
-    args = parser.parse_args()
-
-    pipeline = MedicalDocumentPipeline(gemini_api_key=args.api_key)
-    result = pipeline.process_document(args.file, args.output)
-
-    print("\n=== PIPELINE COMPLETE ===")
-    print(f"Document ID: {result['document_id']}")
-    print(f"Prover JSON Path: {result['output_path']}")
-    print(f"Extracted Fields: {json.dumps(result['prover_json']['extracted_data'], indent=2)}")

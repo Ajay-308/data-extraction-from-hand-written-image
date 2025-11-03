@@ -7,20 +7,20 @@ import streamlit as st
 
 from medical_ocr_pipeline import MedicalDocumentPipeline
 
-# ------------------ PAGE CONFIG ------------------
+# PAGE CONFIG 
 st.set_page_config(page_title="Medical Document OCR", page_icon="🏥", layout="wide")
 
 st.sidebar.image("https://img.icons8.com/color/96/000000/medical-doctor.png", width=80)
 st.sidebar.title("⚙️ Configuration")
 
 gemini_key = st.sidebar.text_input(
-    "🔑 Gemini API Key (optional)",
+    "🔑 Gemini API Key (required)",
     type="password",
     help="Leave blank to skip LLM enrichment",
 )
 vector_db_path = st.sidebar.text_input("💾 Vector DB Path", value="./medical_vector_db")
 
-# ------------------ INIT ------------------
+# INIT pipeline
 if "pipeline" not in st.session_state:
     st.session_state.pipeline = None
 
@@ -36,19 +36,19 @@ if st.sidebar.button("🚀 Initialize Pipeline"):
         st.error(f"❌ Initialization failed: {e}")
 
 st.title("🏥 Medical Document OCR Pipeline")
-st.markdown(
-    """
-Upload PDFs or images — files will be processed and a **PROVER JSON**  
-will be **automatically downloaded directly to your browser’s Downloads folder.**  
+st.markdown("""
+📤 **Upload PDFs or Images** — files will be processed automatically.  
+Once processing is complete, a **PROVER JSON** file will be generated.  
+You can **download it manually** using the **Download JSON** button below.  
 *(No files are stored on the server.)*
-"""
-)
+""")
+
 
 if not st.session_state.pipeline:
     st.warning("Please initialize the pipeline from the sidebar to proceed.")
     st.stop()
 
-# ------------------ UPLOAD + PROCESS ------------------
+# UPLOAD + PROCESS 
 uploaded = st.file_uploader(
     "📤 Upload PDF / Image file(s)",
     type=["pdf", "png", "jpg", "jpeg", "tiff"],
